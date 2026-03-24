@@ -62,18 +62,60 @@ remove_outlier_rows <- function(df, cols) {
 }
 
 coerce_dates <- function(x) {
-  if (inherits(x, "Date") || inherits(x, "POSIXct")) {
-    return(x)
+  if (inherits(x, "Date")) {
+    return(list(value = x, converted = TRUE))
   }
+  if (inherits(x, "POSIXct") || inherits(x, "POSIXt")) {
+    return(list(value = as.Date(x), converted = TRUE))
+  }
+
+  if (is.factor(x)) {
+    x <- as.character(x)
+  }
+
   if (!is.character(x)) {
-    return(x)
+    return(list(value = x, converted = FALSE))
   }
-  parsed <- suppressWarnings(as.Date(x))
-  share_parsed <- mean(!is.na(parsed))
-  if (is.nan(share_parsed) || share_parsed < 0.8) {
-    return(x)
+
+  trimmed <- trimws(x)
+  if (!length(trimmed)) {
+    return(list(value = x, converted = FALSE))
   }
-  parsed
+
+  candidate_formats <- c(
+    "%Y-%m-%d",
+    "%m/%d/%Y",
+    "%d/%m/%Y",
+    "%Y/%m/%d",
+    "%m-%d-%Y",
+    "%d-%b-%Y",
+    "%b %d, %Y"
+  )
+
+  valid_mask <- is.na(trimmed) | trimmed == ""
+  combined_parsed <- rep(as.Date(NA), length(trimmed))
+
+  for (fmt in candidate_formats) {
+    unresolved <- !valid_mask & is.na(combined_parsed)
+    if (!any(unresolved)) {
+      break
+    }
+    parsed <- suppressWarnings(as.Date(trimmed[unresolved], format = fmt))
+    combined_parsed[unresolved] <- parsed
+  }
+
+  unresolved <- !valid_mask & is.na(combined_parsed)
+  if (any(unresolved)) {
+    combined_parsed[unresolved] <- suppressWarnings(as.Date(trimmed[unresolved]))
+  }
+
+  parsed_share <- mean(valid_mask | !is.na(combined_parsed))
+  if (is.nan(parsed_share) || parsed_share < 0.8) {
+    return(list(value = x, converted = FALSE))
+  }
+
+  combined_parsed[valid_mask] <- as.Date(NA)
+  list(value = combined_parsed, converted = TRUE)
 }
 
 read_uploaded_data <- function(path, ext) {
@@ -366,8 +408,22 @@ server <- function(input, output, session) {
     }
 
     if (isTRUE(input$coerce_date_columns)) {
-      df[] <- lapply(df, coerce_dates)
-      log_entries <- c(log_entries, "Converted date-like character columns where possible.")
+      converted_cols <- character(0)
+      for (col in names(df)) {
+        result <- tryCatch(
+          coerce_dates(df[[col]]),
+          error = function(e) list(value = df[[col]], converted = FALSE)
+        )
+        df[[col]] <- result$value
+        if (isTRUE(result$converted)) {
+          converted_cols <- c(converted_cols, col)
+        }
+      }
+      if (length(converted_cols)) {
+        log_entries <- c(log_entries, paste("Converted date-like columns:", paste(converted_cols, collapse = ", ")))
+      } else {
+        log_entries <- c(log_entries, "No date-like columns were detected.")
+      }
     }
 
     if (isTRUE(input$remove_duplicates)) {

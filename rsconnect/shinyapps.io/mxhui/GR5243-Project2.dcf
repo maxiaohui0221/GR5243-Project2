@@ -1,0 +1,13 @@
+name: GR5243-Project2
+title: GR5243-Project2
+username: mxhui
+account: mxhui
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 16955980
+bundleId: 11746113
+url: https://mxhui.shinyapps.io/GR5243-Project2/
+version: 1
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: Project 2.pdf|README.md|report.md

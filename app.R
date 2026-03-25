@@ -130,17 +130,145 @@ read_uploaded_data <- function(path, ext) {
     return(readxl::read_excel(path) |> as.data.frame(check.names = FALSE))
   }
   if (ext == "json") {
-    payload <- jsonlite::fromJSON(path, flatten = TRUE)
-    if (is.data.frame(payload)) {
-      return(payload)
-    }
-    if (is.list(payload)) {
-      data_frame_index <- which(vapply(payload, is.data.frame, logical(1)))[1]
-      if (!is.na(data_frame_index)) {
-        return(payload[[data_frame_index]])
+    read_ndjson <- function(path) {
+      lines <- readLines(path, warn = FALSE, encoding = "UTF-8")
+      lines <- trimws(lines)
+      lines <- lines[nzchar(lines)]
+      if (!length(lines)) {
+        stop("The uploaded JSON file is empty.")
       }
-      return(as.data.frame(payload, check.names = FALSE))
+
+      records <- lapply(seq_along(lines), function(i) {
+        tryCatch(
+          jsonlite::fromJSON(lines[[i]], simplifyVector = FALSE),
+          error = function(e) {
+            stop(sprintf("Invalid JSON on line %d: %s", i, conditionMessage(e)))
+          }
+        )
+      })
+
+      if (!all(vapply(records, is.list, logical(1)))) {
+        stop("NDJSON files must contain one JSON object per line.")
+      }
+
+      all_names <- unique(unlist(lapply(records, names), use.names = FALSE))
+      rows <- lapply(records, function(rec) {
+        row <- setNames(vector("list", length(all_names)), all_names)
+        for (nm in all_names) {
+          value <- rec[[nm]]
+          if (is.null(value)) {
+            row[[nm]] <- NA
+          } else if (length(value) == 1 && (is.atomic(value) || inherits(value, "Date") || inherits(value, "POSIXt"))) {
+            row[[nm]] <- value
+          } else {
+            row[[nm]] <- as.character(jsonlite::toJSON(value, auto_unbox = TRUE, null = "null"))
+          }
+        }
+        as.data.frame(row, check.names = FALSE, stringsAsFactors = FALSE)
+      })
+      dplyr::bind_rows(rows)
     }
+
+    normalize_json_value <- function(x) {
+      if (is.null(x)) {
+        return(NA)
+      }
+      if (length(x) == 1 && (is.atomic(x) || inherits(x, "Date") || inherits(x, "POSIXt"))) {
+        return(x)
+      }
+      as.character(jsonlite::toJSON(x, auto_unbox = TRUE, null = "null"))
+    }
+
+    records_to_df <- function(records) {
+      if (!length(records)) {
+        return(data.frame())
+      }
+      all_names <- unique(unlist(lapply(records, names), use.names = FALSE))
+      if (!length(all_names)) {
+        return(data.frame(value = vapply(records, normalize_json_value, character(1)), stringsAsFactors = FALSE))
+      }
+
+      rows <- lapply(records, function(rec) {
+        row <- setNames(vector("list", length(all_names)), all_names)
+        for (nm in all_names) {
+          row[[nm]] <- normalize_json_value(rec[[nm]])
+        }
+        as.data.frame(row, check.names = FALSE, stringsAsFactors = FALSE)
+      })
+      dplyr::bind_rows(rows)
+    }
+
+    normalize_json_payload <- function(payload) {
+      if (is.data.frame(payload)) {
+        return(as.data.frame(jsonlite::flatten(payload), check.names = FALSE, stringsAsFactors = FALSE))
+      }
+
+      if (!is.list(payload)) {
+        return(data.frame(value = normalize_json_value(payload), stringsAsFactors = FALSE))
+      }
+
+      if (!length(payload)) {
+        return(data.frame())
+      }
+
+      if (!is.null(names(payload))) {
+        record_array_index <- which(vapply(payload, function(x) {
+          is.list(x) && length(x) > 0 &&
+            all(vapply(x, function(y) is.list(y) || is.data.frame(y), logical(1)))
+        }, logical(1)))
+        if (length(record_array_index)) {
+          return(records_to_df(payload[[record_array_index[1]]]))
+        }
+      }
+
+      if (!is.null(names(payload)) && length(names(payload)) == length(payload) &&
+          all(vapply(payload, function(x) {
+            is.atomic(x) || is.factor(x) || inherits(x, "Date") || inherits(x, "POSIXt")
+          }, logical(1)))) {
+        lengths <- vapply(payload, length, integer(1))
+        if (length(unique(lengths)) == 1) {
+          return(as.data.frame(payload, check.names = FALSE, stringsAsFactors = FALSE))
+        }
+        return(as.data.frame(lapply(payload, normalize_json_value), check.names = FALSE, stringsAsFactors = FALSE))
+      }
+
+      if (all(vapply(payload, function(x) is.list(x) || is.data.frame(x), logical(1)))) {
+        return(records_to_df(payload))
+      }
+
+      nested_candidates <- lapply(payload, function(x) {
+        tryCatch(normalize_json_payload(x), error = function(e) NULL)
+      })
+      nested_candidates <- Filter(function(x) !is.null(x) && ncol(x) > 0, nested_candidates)
+      if (length(nested_candidates)) {
+        candidate_score <- vapply(nested_candidates, function(df) max(1, nrow(df)) * max(1, ncol(df)), numeric(1))
+        best_candidate <- nested_candidates[[which.max(candidate_score)]]
+        if (nrow(best_candidate) > 1 || length(nested_candidates) == 1) {
+          return(best_candidate)
+        }
+      }
+
+      if (!is.null(names(payload))) {
+        return(as.data.frame(lapply(payload, normalize_json_value), check.names = FALSE, stringsAsFactors = FALSE))
+      }
+
+      data.frame(value = vapply(payload, normalize_json_value, character(1)), stringsAsFactors = FALSE)
+    }
+
+    payload <- tryCatch(
+      jsonlite::fromJSON(path, simplifyVector = FALSE),
+      error = function(e) {
+        msg <- conditionMessage(e)
+        if (grepl("extra data|trailing garbage", msg, ignore.case = TRUE)) {
+          return(read_ndjson(path))
+        }
+        stop(e)
+      }
+    )
+    if (is.data.frame(payload)) {
+      return(as.data.frame(payload, check.names = FALSE, stringsAsFactors = FALSE))
+    }
+    return(normalize_json_payload(payload))
   }
   if (ext == "rds") {
     payload <- readRDS(path)
@@ -157,6 +285,52 @@ preview_table <- function(df, n = 10) {
     return(data.frame(Message = "No rows available to display."))
   }
   utils::head(df, n)
+}
+
+empty_table_message <- function(message) {
+  data.frame(Message = message, check.names = FALSE, stringsAsFactors = FALSE)
+}
+
+default_plot_x <- function(df, plot_type) {
+  numeric_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  categorical_cols <- names(df)[vapply(df, function(col) is.character(col) || is.factor(col), logical(1))]
+  grouping_cols <- categorical_cols[vapply(df[categorical_cols], function(col) {
+    distinct_count <- length(unique(stats::na.omit(as.character(col))))
+    distinct_count > 1 && distinct_count <= max(20, ceiling(0.1 * nrow(df)))
+  }, logical(1))]
+  all_cols <- names(df)
+
+  if (plot_type %in% c("Histogram", "Scatter plot", "Correlation heatmap")) {
+    return(if (length(numeric_cols)) numeric_cols[1] else if (length(all_cols)) all_cols[1] else character(0))
+  }
+
+  if (plot_type == "Box plot") {
+    return(if (length(grouping_cols)) grouping_cols[1] else if (length(categorical_cols)) categorical_cols[1] else if (length(all_cols)) all_cols[1] else character(0))
+  }
+
+  if (plot_type == "Bar chart") {
+    return(if (length(grouping_cols)) grouping_cols[1] else if (length(categorical_cols)) categorical_cols[1] else if (length(all_cols)) all_cols[1] else character(0))
+  }
+
+  if (length(all_cols)) all_cols[1] else character(0)
+}
+
+default_plot_y <- function(df, plot_type, x_col = NULL) {
+  numeric_cols <- names(df)[vapply(df, is.numeric, logical(1))]
+  if (!length(numeric_cols)) {
+    return(character(0))
+  }
+
+  if (plot_type == "Scatter plot") {
+    candidates <- setdiff(numeric_cols, x_col)
+    return(if (length(candidates)) candidates[1] else numeric_cols[1])
+  }
+
+  if (plot_type == "Box plot") {
+    return(numeric_cols[1])
+  }
+
+  numeric_cols[1]
 }
 
 ui <- page_navbar(
@@ -354,30 +528,65 @@ ui <- page_navbar(
 )
 
 server <- function(input, output, session) {
-  raw_data <- reactive({
+  raw_data_result <- reactive({
     if (identical(input$source_type, "Built-in dataset")) {
-      return(as.data.frame(builtin_datasets[[input$builtin_name]], check.names = FALSE))
+      return(list(
+        data = as.data.frame(builtin_datasets[[input$builtin_name]], check.names = FALSE),
+        error = NULL
+      ))
     }
 
     req(input$upload_file)
-    ext <- tools::file_ext(input$upload_file$name)
-    df <- read_uploaded_data(input$upload_file$datapath, ext)
-    as.data.frame(df, check.names = FALSE)
+    tryCatch({
+      ext <- tools::file_ext(input$upload_file$name)
+      df <- read_uploaded_data(input$upload_file$datapath, ext)
+      list(
+        data = as.data.frame(df, check.names = FALSE),
+        error = NULL
+      )
+    }, error = function(e) {
+      list(
+        data = NULL,
+        error = paste("Could not read uploaded file:", conditionMessage(e))
+      )
+    })
+  })
+
+  raw_data <- reactive({
+    result <- raw_data_result()
+    shiny::validate(shiny::need(is.null(result$error), result$error))
+    result$data
   })
 
   output$raw_rows <- renderText({
-    nrow(raw_data())
+    result <- raw_data_result()
+    if (!is.null(result$error) || is.null(result$data)) {
+      return("0")
+    }
+    nrow(result$data)
   })
 
   output$raw_cols <- renderText({
-    ncol(raw_data())
+    result <- raw_data_result()
+    if (!is.null(result$error) || is.null(result$data)) {
+      return("0")
+    }
+    ncol(result$data)
   })
 
   output$raw_missing <- renderText({
-    sum(is.na(raw_data()))
+    result <- raw_data_result()
+    if (!is.null(result$error) || is.null(result$data)) {
+      return("0")
+    }
+    sum(is.na(result$data))
   })
 
   output$raw_types <- renderTable({
+    result <- raw_data_result()
+    if (!is.null(result$error) || is.null(result$data)) {
+      return(empty_table_message(if (is.null(result$error)) "No data loaded." else result$error))
+    }
     df <- raw_data()
     data.frame(
       Column = names(df),
@@ -387,6 +596,10 @@ server <- function(input, output, session) {
   }, striped = TRUE, bordered = TRUE, width = "100%")
 
   output$raw_preview <- renderTable({
+    result <- raw_data_result()
+    if (!is.null(result$error) || is.null(result$data)) {
+      return(empty_table_message(if (is.null(result$error)) "No data loaded." else result$error))
+    }
     preview_table(raw_data())
   }, striped = TRUE, bordered = TRUE, width = "100%")
 
@@ -769,10 +982,13 @@ server <- function(input, output, session) {
     numeric_cols <- names(df)[vapply(df, is.numeric, logical(1))]
     categorical_cols <- names(df)[vapply(df, function(col) is.character(col) || is.factor(col), logical(1))]
     all_cols <- names(df)
+    plot_type <- if (is.null(input$plot_type)) "Histogram" else input$plot_type
+    selected_x <- default_plot_x(df, plot_type)
+    selected_y <- default_plot_y(df, plot_type, selected_x)
 
-    updateSelectInput(session, "plot_x", choices = all_cols)
-    updateSelectInput(session, "plot_y", choices = numeric_cols)
-    updateSelectInput(session, "plot_color", choices = c("None", categorical_cols))
+    updateSelectInput(session, "plot_x", choices = all_cols, selected = selected_x)
+    updateSelectInput(session, "plot_y", choices = numeric_cols, selected = selected_y)
+    updateSelectInput(session, "plot_color", choices = c("None", categorical_cols), selected = "None")
   })
 
   output$filter_control <- renderUI({
@@ -815,7 +1031,11 @@ server <- function(input, output, session) {
   output$plot_x_ui <- renderUI({
     df <- filtered_data()
     cols <- names(df)
-    selectInput("plot_x", "X variable", choices = cols, selected = cols[1])
+    selected <- input$plot_x
+    if (is.null(selected) || !selected %in% cols) {
+      selected <- default_plot_x(df, input$plot_type)
+    }
+    selectInput("plot_x", "X variable", choices = cols, selected = selected)
   })
 
   output$plot_y_ui <- renderUI({
@@ -824,7 +1044,11 @@ server <- function(input, output, session) {
     if (!length(numeric_cols)) {
       return(NULL)
     }
-    selectInput("plot_y", "Y variable", choices = numeric_cols, selected = numeric_cols[min(2, length(numeric_cols))])
+    selected <- input$plot_y
+    if (is.null(selected) || !selected %in% numeric_cols) {
+      selected <- default_plot_y(df, input$plot_type, input$plot_x)
+    }
+    selectInput("plot_y", "Y variable", choices = numeric_cols, selected = selected)
   })
 
   output$plot_color_ui <- renderUI({
@@ -835,17 +1059,20 @@ server <- function(input, output, session) {
 
   output$eda_plot <- renderPlot({
     df <- filtered_data()
-    req(nrow(df) > 0)
+    shiny::validate(shiny::need(nrow(df) > 0, "No rows available for plotting after the current filters."))
 
     use_color <- !is.null(input$plot_color) && input$plot_color != "None" && input$plot_color %in% names(df)
 
     if (input$plot_type == "Histogram") {
-      req(input$plot_x, is.numeric(df[[input$plot_x]]))
+      shiny::validate(shiny::need(!is.null(input$plot_x) && input$plot_x %in% names(df), "Choose an X variable."))
+      shiny::validate(shiny::need(is.numeric(df[[input$plot_x]]), "Histogram requires a numeric X variable."))
       ggplot(df, aes(x = .data[[input$plot_x]])) +
         geom_histogram(fill = "#1b4965", color = "white", bins = 20) +
         labs(x = input$plot_x, y = "Count")
     } else if (input$plot_type == "Scatter plot") {
-      req(input$plot_x, input$plot_y, is.numeric(df[[input$plot_x]]), is.numeric(df[[input$plot_y]]))
+      shiny::validate(shiny::need(!is.null(input$plot_x) && input$plot_x %in% names(df), "Choose an X variable."))
+      shiny::validate(shiny::need(!is.null(input$plot_y) && input$plot_y %in% names(df), "Choose a Y variable."))
+      shiny::validate(shiny::need(is.numeric(df[[input$plot_x]]) && is.numeric(df[[input$plot_y]]), "Scatter plot requires numeric X and Y variables."))
       if (use_color) {
         ggplot(df, aes(x = .data[[input$plot_x]], y = .data[[input$plot_y]], color = .data[[input$plot_color]])) +
           geom_point(size = 3, alpha = 0.7) +
@@ -856,7 +1083,9 @@ server <- function(input, output, session) {
           geom_smooth(method = "lm", se = FALSE, color = "#5fa8d3")
       }
     } else if (input$plot_type == "Box plot") {
-      req(input$plot_x, input$plot_y)
+      shiny::validate(shiny::need(!is.null(input$plot_x) && input$plot_x %in% names(df), "Choose an X variable."))
+      shiny::validate(shiny::need(!is.null(input$plot_y) && input$plot_y %in% names(df), "Choose a Y variable."))
+      shiny::validate(shiny::need(is.numeric(df[[input$plot_y]]), "Box plot requires a numeric Y variable."))
       if (use_color) {
         ggplot(df, aes(x = .data[[input$plot_x]], y = .data[[input$plot_y]], fill = .data[[input$plot_color]])) +
           geom_boxplot(alpha = 0.7) +
@@ -867,7 +1096,7 @@ server <- function(input, output, session) {
           theme(axis.text.x = element_text(angle = 35, hjust = 1))
       }
     } else if (input$plot_type == "Bar chart") {
-      req(input$plot_x)
+      shiny::validate(shiny::need(!is.null(input$plot_x) && input$plot_x %in% names(df), "Choose an X variable."))
       if (use_color) {
         ggplot(df, aes(x = .data[[input$plot_x]], fill = .data[[input$plot_color]])) +
           geom_bar(position = "dodge") +

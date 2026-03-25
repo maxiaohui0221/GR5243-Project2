@@ -5,7 +5,7 @@ account: mxhui
 server: shinyapps.io
 hostUrl: https://api.shinyapps.io/v1
 appId: 16955980
-bundleId: 11746113
+bundleId: 11756693
 url: https://mxhui.shinyapps.io/GR5243-Project2/
 version: 1
 asMultiple: FALSE

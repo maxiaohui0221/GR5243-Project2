@@ -1,4 +1,4 @@
-# Project 2: DataPilot Shiny Toolkit
+# DataPilot Shiny Toolkit
 
 This repository contains an R Shiny web application for uploading, cleaning, transforming, and exploring datasets interactively. The app was designed to match the Project 2 requirements for dataset loading, preprocessing, feature engineering, EDA, and a user-friendly interface.
 
